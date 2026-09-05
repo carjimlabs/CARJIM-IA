@@ -1,0 +1,4 @@
+# Dependencias so para empacotar o app.py como executavel (.exe).
+# Nao sao necessarias para rodar o projeto nem o app.py normalmente --
+# so quem for gerar o executavel precisa instalar isso.
+pyinstaller>=6.0
