@@ -1,18 +1,21 @@
 """
-App grafico (Tkinter) para rodar o modelo treinado numa imagem escolhida
-pelo usuario, com checkboxes para escolher quais classes mostrar
+App grafico (Tkinter) para rodar o modelo treinado sobre capturas ao vivo da
+tela do usuario, com checkboxes para escolher quais classes mostrar
 (Hemacia/Leucocito/Plaqueta).
 
 Uso: python app.py
 """
+import ctypes
 import queue
 import sys
 import threading
 import tkinter as tk
+from ctypes import wintypes
+from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-from PIL import Image, ImageTk
+from PIL import Image, ImageGrab, ImageTk
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
@@ -23,7 +26,6 @@ from detection_core import (  # noqa: E402
     MODEL_PATH,
     PLATELET_CLASS_NAME,
     RBC_CLASS_NAME,
-    VALID_EXTENSIONS,
     draw_detections,
     estimate_rbc_size,
     load_font,
@@ -35,6 +37,44 @@ from detection_core import (  # noqa: E402
 
 OUTPUT_DIR = PROJECT_ROOT / "Imagens analisadas"
 CANVAS_BG = "#1e1e1e"
+LIVE_CAPTURE_INTERVAL_MS = 2000  # tempo entre o fim de uma analise e a proxima captura
+
+MONITORINFOF_PRIMARY = 0x1
+
+
+class _MONITORINFO(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("rcMonitor", wintypes.RECT),
+        ("rcWork", wintypes.RECT),
+        ("dwFlags", wintypes.DWORD),
+    ]
+
+
+def list_monitors() -> list[dict]:
+    """Enumera os monitores fisicos via user32 (ctypes -- sem dependencia
+    nova). Cada item tem 'bbox' (esquerda, topo, direita, baixo) nas mesmas
+    coordenadas de tela usadas por ImageGrab.grab(all_screens=True) e
+    'primary' (bool)."""
+    monitors: list[dict] = []
+
+    MonitorEnumProc = ctypes.WINFUNCTYPE(
+        ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(wintypes.RECT), ctypes.c_ssize_t
+    )
+
+    def _callback(hmonitor, _hdc, _rect_ptr, _data):
+        info = _MONITORINFO()
+        info.cbSize = ctypes.sizeof(_MONITORINFO)
+        if ctypes.windll.user32.GetMonitorInfoW(hmonitor, ctypes.byref(info)):
+            r = info.rcMonitor
+            monitors.append({
+                "bbox": (r.left, r.top, r.right, r.bottom),
+                "primary": bool(info.dwFlags & MONITORINFOF_PRIMARY),
+            })
+        return 1
+
+    ctypes.windll.user32.EnumDisplayMonitors(0, 0, MonitorEnumProc(_callback), 0)
+    return monitors
 
 
 class App:
@@ -54,8 +94,13 @@ class App:
         self._last_detections: list | None = None
         self._last_had_platelet_scan = False
         self._last_annotated_full: Image.Image | None = None
-        self._current_image_path: Path | None = None
+        self._last_capture_at: datetime | None = None
         self._photo_image = None  # referencia forte -- sem isso o Tk descarta e o canvas fica em branco
+
+        self._live_running = False
+        self._capture_after_id = None
+        self.monitor_options = self._build_monitor_options()
+        self.monitor_var = tk.StringVar(value=self.monitor_options[0]["label"])
 
         # Um checkbox por classe da taxonomia (detection_core.CLASSES), na
         # mesma ordem. Todos marcados por padrao.
@@ -69,6 +114,40 @@ class App:
         self._build_widgets()
         self._start_model_load()
         self.root.after(100, self._poll_queue)
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    # ------------------------------------------------------------------
+    # opcoes de tela (monitor a capturar)
+    # ------------------------------------------------------------------
+
+    def _build_monitor_options(self) -> list[dict]:
+        try:
+            monitors = list_monitors()
+        except Exception:  # noqa: BLE001 - enumeracao de monitor nao pode derrubar o app
+            monitors = []
+
+        # principal primeiro, depois as demais na ordem devolvida pelo Windows
+        monitors.sort(key=lambda mon: not mon["primary"])
+
+        options = []
+        for index, mon in enumerate(monitors, start=1):
+            left, top, right, bottom = mon["bbox"]
+            width, height = right - left, bottom - top
+            suffix = " (principal)" if mon["primary"] else ""
+            options.append({
+                "label": f"Tela {index}{suffix} - {width}x{height}",
+                "bbox": mon["bbox"],
+            })
+
+        options.append({"label": "Todas as telas", "bbox": None})
+        return options
+
+    def _selected_monitor_bbox(self):
+        selected_label = self.monitor_var.get()
+        for option in self.monitor_options:
+            if option["label"] == selected_label:
+                return option["bbox"]
+        return None
 
     # ------------------------------------------------------------------
     # construcao da interface
@@ -93,15 +172,25 @@ class App:
         actions_row = ttk.Frame(self.root, padding=(8, 2, 8, 8))
         actions_row.pack(side="top", fill="x")
 
-        self.select_button = ttk.Button(
-            actions_row, text="Selecionar Imagem...", command=self._on_select_image, state="disabled"
+        self.capture_button = ttk.Button(
+            actions_row, text="Iniciar Captura ao Vivo", command=self._on_toggle_live_capture, state="disabled"
         )
-        self.select_button.pack(side="left", padx=4)
+        self.capture_button.pack(side="left", padx=4)
 
         self.save_button = ttk.Button(
             actions_row, text="Salvar como...", command=self._on_save, state="disabled"
         )
         self.save_button.pack(side="left", padx=4)
+
+        ttk.Label(actions_row, text="Tela:").pack(side="left", padx=(12, 2))
+        self.monitor_combo = ttk.Combobox(
+            actions_row,
+            textvariable=self.monitor_var,
+            values=[option["label"] for option in self.monitor_options],
+            state="readonly",
+            width=26,
+        )
+        self.monitor_combo.pack(side="left", padx=4)
 
         status_label = ttk.Label(self.root, textvariable=self.status_var, padding=(8, 4))
         status_label.pack(side="top", fill="x")
@@ -132,33 +221,67 @@ class App:
             self.msg_queue.put(("model_error", str(exc)))
 
     # ------------------------------------------------------------------
-    # selecao de imagem e inferencia (thread de fundo, por clique)
+    # captura de tela ao vivo + inferencia (thread de fundo, em loop)
     # ------------------------------------------------------------------
 
-    def _on_select_image(self):
-        extensions = " ".join(f"*{ext}" for ext in sorted(VALID_EXTENSIONS))
-        path_str = filedialog.askopenfilename(
-            title="Selecionar imagem",
-            filetypes=[("Imagens", extensions), ("Todos os arquivos", "*.*")],
-        )
-        if not path_str:
+    def _on_toggle_live_capture(self):
+        if self._live_running:
+            self._stop_live_capture()
+        else:
+            self._start_live_capture()
+
+    def _start_live_capture(self):
+        self._live_running = True
+        self.capture_button.config(text="Parar Captura ao Vivo")
+        self._run_capture_cycle()
+
+    def _stop_live_capture(self):
+        self._live_running = False
+        self.capture_button.config(text="Iniciar Captura ao Vivo")
+        if self._capture_after_id is not None:
+            self.root.after_cancel(self._capture_after_id)
+            self._capture_after_id = None
+        self.status_var.set("Captura ao vivo parada")
+
+    def _run_capture_cycle(self):
+        if not self._live_running:
             return
 
-        image_path = Path(path_str)
         try:
-            image = Image.open(image_path).convert("RGB")
+            image = self._grab_screen_hidden()
         except Exception as exc:  # noqa: BLE001
-            messagebox.showerror("Erro ao abrir imagem", str(exc))
+            self._stop_live_capture()
+            messagebox.showerror("Erro ao capturar a tela", str(exc))
             return
 
-        self._current_image_path = image_path
-        self.status_var.set("Processando...")
-        self._set_controls_enabled(False)
+        self._last_capture_at = datetime.now()
+        self.status_var.set("Analisando captura da tela...")
 
         want_platelet = self.show_vars[PLATELET_CLASS_NAME].get()
         threading.Thread(
             target=self._inference_worker, args=(image, want_platelet), daemon=True
         ).start()
+
+    def _grab_screen_hidden(self) -> Image.Image:
+        """Torna a janela do app invisivel (sem minimizar/perder foco de
+        quem esta usando outra janela) para nao capturar a si mesma, tira o
+        print da tela escolhida no combobox e restaura a visibilidade."""
+        bbox = self._selected_monitor_bbox()
+        self.root.attributes("-alpha", 0.0)
+        self.root.update()
+        try:
+            # all_screens=True sempre -- e o que faz o ImageGrab entender
+            # coordenadas de monitores secundarios (que podem ser negativas)
+            # tanto pro bbox de uma tela especifica quanto pra tela toda.
+            image = ImageGrab.grab(bbox=bbox, all_screens=True)
+        finally:
+            self.root.attributes("-alpha", 1.0)
+        return image.convert("RGB")
+
+    def _schedule_next_capture(self):
+        if not self._live_running:
+            return
+        self._capture_after_id = self.root.after(LIVE_CAPTURE_INTERVAL_MS, self._run_capture_cycle)
 
     def _inference_worker(self, image: Image.Image, want_platelet: bool):
         try:
@@ -196,6 +319,13 @@ class App:
 
     def _on_checkbox_toggle(self):
         if self._last_image is None:
+            return
+
+        # Em captura ao vivo o proximo ciclo ja roda com o estado atual dos
+        # checkboxes em poucos segundos -- nao vale a pena disparar mais uma
+        # thread de reforco so pra essa imagem, que ja vai ficar obsoleta.
+        if self._live_running:
+            self._render()
             return
 
         # Caso especial: o usuario marcou Plaqueta, mas a imagem em cache
@@ -241,7 +371,7 @@ class App:
             self.device = device
             self.font = font
             self.status_var.set("Pronto")
-            self.select_button.config(state="normal")
+            self.capture_button.config(state="normal")
 
         elif kind == "model_error":
             _, error_msg = message
@@ -255,6 +385,7 @@ class App:
             self._last_had_platelet_scan = had_platelet_scan
             self._set_controls_enabled(True)
             self._render()
+            self._schedule_next_capture()
 
         elif kind == "platelet_addon_done":
             _, detections, had_platelet_scan = message
@@ -265,9 +396,10 @@ class App:
 
         elif kind == "inference_error":
             _, error_msg = message
-            self.status_var.set("Pronto" if self._last_image is not None else "Selecione uma imagem")
+            self.status_var.set("Pronto" if self._last_image is not None else "Captura ao vivo parada")
             self._set_controls_enabled(True)
-            messagebox.showerror("Erro ao processar imagem", error_msg)
+            messagebox.showerror("Erro ao processar captura", error_msg)
+            self._schedule_next_capture()
 
     # ------------------------------------------------------------------
     # desenho / filtragem (sincrono, sem thread -- rapido)
@@ -327,16 +459,17 @@ class App:
     # ------------------------------------------------------------------
 
     def _on_save(self):
-        if self._last_annotated_full is None or self._current_image_path is None:
+        if self._last_annotated_full is None or self._last_capture_at is None:
             return
 
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-        default_name = f"{self._current_image_path.stem}_analisado{self._current_image_path.suffix}"
+        timestamp = self._last_capture_at.strftime("%Y%m%d_%H%M%S")
+        default_name = f"captura_{timestamp}_analisada.png"
         path_str = filedialog.asksaveasfilename(
             title="Salvar como",
             initialdir=str(OUTPUT_DIR),
             initialfile=default_name,
-            defaultextension=self._current_image_path.suffix or ".png",
+            defaultextension=".png",
         )
         if not path_str:
             return
@@ -351,9 +484,16 @@ class App:
     # ------------------------------------------------------------------
 
     def _set_controls_enabled(self, enabled: bool):
+        # capture_button fica de fora -- precisa continuar clicavel durante
+        # a analise para o usuario poder parar a captura ao vivo a qualquer
+        # momento.
         state = "normal" if enabled else "disabled"
-        for widget in (self.select_button, self.save_button, *self.class_checks.values()):
+        for widget in (self.save_button, *self.class_checks.values()):
             widget.config(state=state)
+
+    def _on_close(self):
+        self._stop_live_capture()
+        self.root.destroy()
 
 
 def main():

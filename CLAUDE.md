@@ -65,7 +65,7 @@ never generalized to wide field. Kept for reference only; not part of the live p
 generic "Leucócito"):
 
 ```
-python app.py                        # interactive GUI: pick classes, pick an image file, see result
+python app.py                        # interactive GUI: pick classes, then live-capture the screen and see results
 python scripts/04_watch_and_infer.py # watches Imagens a serem analisadas/, auto-processes new files
 ```
 
@@ -142,7 +142,19 @@ loading and inference run on background `threading.Thread`s that post results th
 `queue.Queue`, polled on the main thread via `root.after(100, ...)`. Never touch Tk widgets
 from a worker thread. Checkbox toggles re-filter/redraw from the cached last-inference result
 without re-running the model — except re-enabling "Plaqueta" after it was processed unchecked,
-which triggers the (slow) platelet tile-scan on demand since that pass was skipped originally.
+which triggers the (slow) platelet tile-scan on demand since that pass was skipped originally
+(only when live capture is off; while it's running the next capture cycle picks up the toggle
+within `LIVE_CAPTURE_INTERVAL_MS` anyway).
+
+**Live screen capture (`app.py`)**: "Iniciar Captura ao Vivo" replaced the old file-picker flow
+— there's no source image on disk anymore, the app grabs the user's own screen
+(`ImageGrab.grab(all_screens=True)`) on a loop and re-runs full detection on each frame. Each
+cycle is scheduled via `root.after(...)` only after the previous frame's inference finishes (see
+`_schedule_next_capture`), so slow frames (e.g. platelet tile-scan on) never overlap. Before each
+grab the window makes itself invisible with `root.attributes("-alpha", 0.0)` (not
+withdraw/iconify) so it doesn't capture itself, without stealing focus from whatever window the
+user is actually looking at — restored with alpha 1.0 right after. "Salvar como..." now names
+files from the capture timestamp instead of a source path.
 
 **Windows/background-task caveat**: in this environment, launching long GPU jobs (training) via
 the Bash tool's `run_in_background` has been unreliable — the task can be killed on its own well
