@@ -22,3 +22,7 @@ models/*
 # Runtime input/output image folders (user data, not source)
 /Imagens a serem analisadas/
 /Imagens analisadas/
+
+# Raw slide-scan videos/photos (source material for scripts/14, not versioned)
+/Videos/
+/Pictures/
