@@ -30,7 +30,7 @@ IMG_SIZE = 1280
 # QUANDO a GPU nao esta disputando VRAM com navegador/launchers. Com o desktop
 # cheio, o pico da validacao ja estourou os 12 GB com batch=8 -- nesse caso
 # baixe para 4.
-BATCH = 8
+BATCH = 4
 PATIENCE = 20
 RUN_NAME = "carjim_train"
 # workers=2 (nao o default 8): a maquina so tem 16 GB de RAM. No Windows cada
