@@ -46,7 +46,7 @@ python scripts/07_add_platelet_crops.py      # optional: merges platelet.zip cro
 python scripts/08_merge_roboflow_allidb.py   # optional: merges a Roboflow ALL_IDB export (WBC+platelet, no RBC — see caveat)
 python scripts/03_train.py                   # fine-tunes YOLOv8 (imgsz=1280), writes models/carjim_best.pt
 ```
-The current `models/carjim_best.pt` is the working 3-class checkpoint
+The current `models/carjim_best.pt` is the working 3-class checkpoint (primary detector — RBC source)
 (`models/carjim_best_3class_pre_diferencial.pt` is an identical backup). `data/bccd/` was
 later migrated to a dead-end 7-class layout — before re-running `03_train.py`, restore the
 3-class labels/yaml from `data/bccd/labels_backup_pre_migracao/` (+ `dataset.yaml.bak_pre_migracao`).
@@ -58,7 +58,20 @@ python scripts/13_train_wbc_classifier.py       # trains YOLOv8-cls (imgsz=128),
 python scripts/15_build_wbc_memory.py           # kNN example bank (models/wbc_memory.pt) + val accuracy per KNN_BLEND; re-run after 13
 ```
 
-**Evaluation**: `python scripts/16_eval_scale_robustness.py [model.pt ...]` builds synthetic
+**Detector ensemble**: `models/carjim_wbc_plt.pt` is a second 3-class detector, trained by
+`03_train.py` with `SCALE_AUG=0.75` (stronger zoom augmentation). On real video frames it is
+better at WBC/platelets and worse at RBC than `carjim_best.pt`, so `detection_core` runs both
+when it exists: RBC from the primary, WBC/Platelets from the secondary (mean F1 0.816 vs
+0.772/0.786 alone; averaging the two models' weights was worse than either). Note that
+`03_train.py` writes `carjim_best.pt` — a new scale-aug retrain replaces the *primary*, so
+back it up and rename the output to `carjim_wbc_plt.pt` instead.
+
+**Evaluation**: `python scripts/17_eval_real_video_frames.py a.pt b.pt ...` samples frames
+from `Videos/` between the ones used for training, uses the union of all models' detections
+on the original frame as reference (no hand labels exist — a model's miss counts against it,
+but any model's false positive becomes "truth"; check the previews in `runs/eval_real/`),
+and simulates closer/farther shots. Prefer it over `16` for real-photo decisions.
+`python scripts/16_eval_scale_robustness.py [model.pt ...]` builds synthetic
 zoom variants of the BCCD val split (zoom-in crops, k x k full-resolution mosaics for
 zoom-out) and reports P/R/F1 per class for each detection mode (base / TTA / scale
 normalization / both) into `runs/eval_scale/`. Use it to compare modes and models; BCCD
@@ -112,18 +125,22 @@ photo zoom), `draw_detections()`.
 
 **Scale normalization (`detect_cells()`, called by `primary_detections()`)**: the RBC's
 pixel size measures photo zoom. The detector only works in two RBC-size bands at the network
-input: ~20-60 px (real wide-field photos, `realslide_`) and ~175-300 px (BCCD/TXL-PBC).
-Measured: a BCCD-style image with RBC <= ~55 px yields ZERO RBC detections, but the real
-wide-field photos work best untouched at ~38 px — the small band is appearance-dependent. So
-the small band is trusted only if the normal pass found >= `SCALE_PROBE_MIN_RBC` RBCs;
-otherwise it probes 0.5x and 3x (tiled), measures RBC size, and re-runs at the target
-(tiled upscale via `_tiled_predict` or smaller `imgsz`). Don't "simplify" this into a single
+input: ~35-60 px (real wide-field photos) and ~175-300 px (BCCD/TXL-PBC).
+Measured: a BCCD-style image with RBC <= ~55 px yields ZERO RBC detections; real video
+frames at ~40-55 px work best untouched, but at ~25-30 px the detector misses about half the
+RBCs and finds nearly all of them upscaled to ~70 px. So: if the normal pass found >=
+`SCALE_PROBE_MIN_RBC` RBCs, only RBCs < 35 px get upscaled (to `RBC_SMALL_TARGET`); otherwise
+it probes 0.5x and 3x (tiled), measures RBC size, and re-runs at the target (tiled upscale via
+`_tiled_predict` or smaller `imgsz`). `_tiled_predict` drops boxes touching inner tile edges
+and fragments mostly inside another box (`SCALE_MERGE_IOS`). With the ensemble, the zoom is
+chosen once from the primary's RBCs and both detectors run at it. Don't "simplify" this into a single
 target size without re-running `16`. `USE_TTA` toggles Ultralytics test-time augmentation.
 
 **WBC kNN (`Detector.knn_probs`)**: an image "RAG" for the subtype classifier — the
 classifier's penultimate embedding (captured by a forward hook on the head's `linear`) is
 matched against `models/wbc_memory.pt` and the neighbours' votes are blended in with
-`KNN_BLEND`. New teacher-corrected crops go in `Exemplos de leucocitos/<Classe>/` and are added
+`KNN_BLEND` (0.5 — on real photos the classifier alone called lymphocytes "basophil" where
+the kNN was right). New teacher-corrected crops go in `Exemplos de leucocitos/<Classe>/` and are added
 by re-running `15` — no retraining. The bank stores the classifier's sha1 and is ignored if
 stale.
 

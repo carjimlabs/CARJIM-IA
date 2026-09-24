@@ -42,6 +42,13 @@ def resolve_model_path() -> Path:
 
 
 MODEL_PATH = resolve_model_path()               # detector 3 classes
+# Ensemble: segundo detector de 3 classes, treinado com augmentation de escala
+# mais forte (03_train.py, SCALE_AUG=0.75). Nos frames reais dos videos
+# (17_eval_real_video_frames.py) ele e melhor em leucocitos/plaquetas e pior em
+# hemacias que o carjim_best.pt; rodar os dois e pegar cada classe do melhor
+# deu F1 0.815 contra 0.772/0.786 de cada um sozinho (media dos pesos dos
+# dois ficou pior que ambos). Custa o dobro de tempo. Opcional.
+SECONDARY_MODEL_PATH = _resolve("carjim_wbc_plt.pt")
 CLASSIFIER_PATH = _resolve("wbc_classifier.pt")  # classificador de subtipo
 # banco de exemplos (embeddings) para o kNN do classificador -- gerado por
 # scripts/15_build_wbc_memory.py; opcional
@@ -78,12 +85,16 @@ PLATELET_MERGE_IOU = 0.3
 # (~175-300 px). Medido com 16_eval_scale_robustness.py e varredura manual:
 #   - imagem tipo BCCD com hemacia <= ~55 px: o detector acha ZERO hemacias;
 #     ampliada para ~100-150 px volta a F1 ~0.7 (o melhor alvo foi ~100-110).
-#   - fotos realslide_ (~38 px): a passada normal e a melhor; ampliar piora.
+#   - frames reais dos videos (17_eval_real_video_frames.py + inspecao visual):
+#     com hemacia em ~40-55 px a passada normal ja e a melhor; em ~25-30 px
+#     (VID_0001/0006/0007) o detector perde cerca de metade das hemacias e,
+#     ampliado para ~70 px, passa a marcar quase todas.
+#   - frames reais em zoom maior (60-80 px): ampliar mais para 110 piorou.
 # Por isso a faixa pequena so e mantida quando a 1a passada de fato achou
 # hemacias; se achou poucas, testa ampliado/reduzido (ver detect_cells).
 SCALE_NORMALIZATION = True
-RBC_SMALL_BAND = (20.0, 60.0)     # faixa das fotos reais: mantida se achou hemacias
-RBC_SMALL_TARGET = 38.0           # alvo quando a hemacia e menor que a faixa pequena
+RBC_SMALL_BAND = (35.0, 60.0)     # faixa das fotos reais: mantida se achou hemacias
+RBC_SMALL_TARGET = 70.0           # alvo quando a hemacia e menor que a faixa pequena
 RBC_GAP_TARGET = 110.0            # alvo entre as faixas (nenhum dado de treino ali)
 RBC_LARGE_BAND = (175.0, 300.0)
 RBC_LARGE_TARGET = 250.0          # alvo quando a hemacia e maior que a faixa grande
@@ -96,6 +107,7 @@ SCALE_TILE_BATCH = 4
 MIN_PREDICT_IMGSZ = 320
 TILE_EDGE_MARGIN_PX = 3
 SCALE_MERGE_IOU = 0.5
+SCALE_MERGE_IOS = 0.6
 # Test-time augmentation do Ultralytics (flip + 3 escalas por passada):
 # ~2-3x mais lento.
 USE_TTA = False
@@ -103,7 +115,11 @@ USE_TTA = False
 # --- kNN sobre exemplos (classificador de subtipo) ---
 # Probabilidade final = (1 - KNN_BLEND) * classificador + KNN_BLEND * votos
 # dos KNN_K exemplos mais parecidos do banco models/wbc_memory.pt.
-KNN_BLEND = 0.3
+# 0.5: no val do Raabin da praticamente o mesmo que 0.3 (0.990 x 0.991), mas
+# em foto real (Pictures/IMG_0001) o classificador sozinho chamou de basofilo
+# (raro, <1%) dois linfocitos que o kNN acertava com 93% -- com 0.3 o kNN
+# perdia a votacao.
+KNN_BLEND = 0.5
 KNN_K = 10
 KNN_TEMPERATURE = 0.05
 
@@ -150,8 +166,14 @@ CLASS_COLORS = {
 class Detector:
     """Empacota o detector de 3 classes + o classificador de subtipo."""
 
-    def __init__(self, det_model: YOLO, cls_model: YOLO | None, device: str, memory: dict | None = None):
+    def __init__(self, det_model: YOLO, cls_model: YOLO | None, device: str, memory: dict | None = None,
+                 det2_model: YOLO | None = None):
         self.det = det_model
+        # detector secundario (ensemble): se presente, WBC/Platelets vem dele
+        # e RBC do principal -- ver SECONDARY_MODEL_PATH
+        self.det2 = det2_model
+        if det2_model is not None and det2_model.names != det_model.names:
+            raise ValueError(f"detectores com classes diferentes: {det_model.names} x {det2_model.names}")
         self.cls = cls_model
         self.device = device
         # banco do kNN: embeddings normalizados (N, D) + indice de classe do
@@ -213,20 +235,24 @@ class Detector:
 
 
 def load_model(device: str | None = None):
-    """Carrega detector + classificador. Devolve (Detector, device).
+    """Carrega detector(es) + classificador. Devolve (Detector, device).
     Se models/wbc_classifier.pt nao existir, o app roda so com o detector e
     os leucocitos aparecem como 'Leucocito' generico."""
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
     det = YOLO(str(MODEL_PATH))
     det.to(device)
+    det2 = None
+    if SECONDARY_MODEL_PATH.exists():
+        det2 = YOLO(str(SECONDARY_MODEL_PATH))
+        det2.to(device)
     cls = None
     memory = None
     if CLASSIFIER_PATH.exists():
         cls = YOLO(str(CLASSIFIER_PATH))
         cls.to(device)
         memory = load_wbc_memory()
-    return Detector(det, cls, device, memory), device
+    return Detector(det, cls, device, memory, det2), device
 
 
 def load_wbc_memory(path: Path = WBC_MEMORY_PATH) -> dict | None:
@@ -278,12 +304,12 @@ def _crop_with_pad(image: Image.Image, x1, y1, x2, y2, pad_frac):
                        min(W, x2 + px), min(H, y2 + py)))
 
 
-def _predict_boxes(detector: Detector, images, imgsz: int, tta: bool):
-    """predict do detector em lote. Devolve, por imagem, lista de
+def _predict_boxes(model: YOLO, images, imgsz: int, tta: bool):
+    """predict de um detector em lote. Devolve, por imagem, lista de
     (det_id, x1, y1, x2, y2, conf) nas coordenadas daquela imagem."""
     out = []
     for i in range(0, len(images), SCALE_TILE_BATCH):
-        results = detector.det.predict(
+        results = model.predict(
             source=images[i:i + SCALE_TILE_BATCH], imgsz=imgsz, conf=CONFIDENCE_THRESHOLD,
             max_det=PREDICT_MAX_DET, augment=tta, verbose=False,
         )
@@ -299,7 +325,7 @@ def _median_rbc_size(boxes, rbc_id):
     return (sizes[len(sizes) // 2], len(sizes)) if sizes else (None, 0)
 
 
-def _tiled_predict(detector: Detector, image: Image.Image, zoom: float, cell_px: float, tta: bool):
+def _tiled_predict(model: YOLO, image: Image.Image, zoom: float, cell_px: float, tta: bool):
     """Deteccao com a imagem ampliada `zoom` vezes (relativo a passada normal
     em PREDICT_IMGSZ), feita em blocos que a rede ve em PREDICT_IMGSZ.
     Sobreposicao >= 2.5 celulas: caixas encostadas numa borda interna do bloco
@@ -324,7 +350,7 @@ def _tiled_predict(detector: Detector, image: Image.Image, zoom: float, cell_px:
 
     boxes, scores, classes = [], [], []
     m = TILE_EDGE_MARGIN_PX
-    for (x0, y0), tile_boxes in zip(origins, _predict_boxes(detector, tiles, PREDICT_IMGSZ, tta)):
+    for (x0, y0), tile_boxes in zip(origins, _predict_boxes(model, tiles, PREDICT_IMGSZ, tta)):
         for c, bx1, by1, bx2, by2, conf in tile_boxes:
             if (bx1 <= m and x0 > 0) or (by1 <= m and y0 > 0) \
                     or (bx2 >= tw - m and x0 + tw < W) or (by2 >= th - m and y0 + th < H):
@@ -337,8 +363,24 @@ def _tiled_predict(detector: Detector, image: Image.Image, zoom: float, cell_px:
     boxes_t = torch.tensor(boxes, dtype=torch.float32)
     scores_t = torch.tensor(scores, dtype=torch.float32)
     classes_t = torch.tensor(classes)
-    keep = batched_nms(boxes_t, scores_t, classes_t, SCALE_MERGE_IOU)
-    return [(classes[i], *boxes[i], scores[i]) for i in keep.tolist()]
+    keep = batched_nms(boxes_t, scores_t, classes_t, SCALE_MERGE_IOU).tolist()
+    # o NMS por IoU nao pega pedaco de celula (caixa pequena dentro da caixa
+    # inteira vinda do bloco vizinho): descarta caixa com >= SCALE_MERGE_IOS
+    # da propria area dentro de outra mais confiante da mesma classe
+    kb = boxes_t[keep]   # batched_nms devolve em ordem decrescente de score
+    area = (kb[:, 2] - kb[:, 0]) * (kb[:, 3] - kb[:, 1])
+    iw = (torch.min(kb[:, None, 2], kb[None, :, 2]) - torch.max(kb[:, None, 0], kb[None, :, 0])).clamp(min=0)
+    ih = (torch.min(kb[:, None, 3], kb[None, :, 3]) - torch.max(kb[:, None, 1], kb[None, :, 1])).clamp(min=0)
+    ios = iw * ih / torch.min(area[:, None], area[None, :]).clamp(min=1e-6)
+    kc = classes_t[keep]
+    overlaps = (ios >= SCALE_MERGE_IOS) & (kc[:, None] == kc[None, :])
+    kept_mask = torch.ones(len(keep), dtype=torch.bool)
+    for a in range(len(keep)):
+        if kept_mask[a]:
+            later = overlaps[a].clone()
+            later[:a + 1] = False
+            kept_mask &= ~later
+    return [(classes[keep[a]], *boxes[keep[a]], scores[keep[a]]) for a in range(len(keep)) if kept_mask[a]]
 
 
 def _target_rbc_net_size(net_size: float, small_band_ok: bool) -> float | None:
@@ -351,50 +393,66 @@ def _target_rbc_net_size(net_size: float, small_band_ok: bool) -> float | None:
     if net_size >= RBC_LARGE_BAND[0]:
         return None
     if small_band_ok:
-        if net_size < RBC_SMALL_BAND[0]:
-            return RBC_SMALL_TARGET
-        if net_size <= RBC_SMALL_BAND[1]:
-            return None
+        # achou hemacias: so amplia se elas estao pequenas demais; entre as
+        # faixas (60-175 px) deixa como esta -- ampliar piorou nos frames reais
+        return RBC_SMALL_TARGET if net_size < RBC_SMALL_BAND[0] else None
     return max(RBC_GAP_TARGET, net_size)
+
+
+def _predict_at_zoom(model: YOLO, image: Image.Image, zoom: float, cell_px: float, tta: bool):
+    """Deteccao com a imagem na escala `zoom` relativa a passada normal."""
+    if abs(math.log(zoom)) < 0.1:
+        return _predict_boxes(model, [image], PREDICT_IMGSZ, tta)[0]
+    if zoom < 1:
+        return _predict_boxes(model, [image], _round_imgsz(PREDICT_IMGSZ * zoom), tta)[0]
+    return _tiled_predict(model, image, zoom, cell_px, tta)
+
+
+def _choose_zoom(detector: Detector, image: Image.Image, base, tta: bool):
+    """Escala a usar (relativa a passada normal) pelo tamanho das hemacias do
+    detector principal. Devolve (zoom, rbc_px, cache) -- cache = {zoom: caixas
+    do detector principal} ja calculadas nas sondagens."""
+    long_side = max(image.size)
+    cache = {1.0: base}
+    rbc_px, n_rbc = _median_rbc_size(base, detector.det_rbc_id)
+    small_band_ok = n_rbc >= SCALE_PROBE_MIN_RBC
+    if not small_band_ok:
+        # quase nenhuma hemacia: a foto pode estar tao longe/perto que o
+        # detector nem enxerga. Testa reduzida e ampliada e fica com a que
+        # achar mais hemacias (so para medir o tamanho delas).
+        cache[0.5] = _predict_at_zoom(detector.det, image, 0.5, 0, tta)
+        cache[SCALE_PROBE_ZOOM] = _tiled_predict(detector.det, image, SCALE_PROBE_ZOOM, long_side / 60, tta)
+        for probe in (cache[0.5], cache[SCALE_PROBE_ZOOM]):
+            px, n = _median_rbc_size(probe, detector.det_rbc_id)
+            if n > n_rbc:
+                rbc_px, n_rbc = px, n
+        if n_rbc < SCALE_PROBE_MIN_RBC:
+            return 1.0, rbc_px, cache
+    net_size = rbc_px * PREDICT_IMGSZ / long_side
+    target = _target_rbc_net_size(net_size, small_band_ok)
+    return (1.0 if target is None else target / net_size), rbc_px, cache
 
 
 def detect_cells(detector: Detector, image: Image.Image, scale_norm: bool | None = None,
                  tta: bool | None = None):
     """Deteccao de 3 classes (ids do detector) com normalizacao de escala
-    opcional -- ver RBC_NET_BANDS."""
+    opcional -- ver RBC_SMALL_BAND. Com detector secundario (ensemble), a
+    escala e decidida pelo principal e os dois rodam nela: RBC vem do
+    principal, WBC/Platelets do secundario."""
     scale_norm = SCALE_NORMALIZATION if scale_norm is None else scale_norm
     tta = USE_TTA if tta is None else tta
-    long_side = max(image.size)
-    base = _predict_boxes(detector, [image], PREDICT_IMGSZ, tta)[0]
-    if not scale_norm or detector.det_rbc_id is None:
-        return base
+    base = _predict_boxes(detector.det, [image], PREDICT_IMGSZ, tta)[0]
+    zoom, rbc_px, cache = 1.0, None, {1.0: base}
+    if scale_norm and detector.det_rbc_id is not None:
+        zoom, rbc_px, cache = _choose_zoom(detector, image, base, tta)
 
-    rbc_px, n_rbc = _median_rbc_size(base, detector.det_rbc_id)
-    small_band_ok = n_rbc >= SCALE_PROBE_MIN_RBC
-    chosen, chosen_zoom = base, 1.0
-    if not small_band_ok:
-        # quase nenhuma hemacia: a foto pode estar tao longe/perto que o
-        # detector nem enxerga. Testa reduzida e ampliada e fica com a que
-        # achar mais hemacias (so para medir o tamanho delas).
-        probes = [
-            (0.5, _predict_boxes(detector, [image], _round_imgsz(PREDICT_IMGSZ * 0.5), tta)[0]),
-            (SCALE_PROBE_ZOOM, _tiled_predict(detector, image, SCALE_PROBE_ZOOM, long_side / 60, tta)),
-        ]
-        for zoom, probe in probes:
-            px, n = _median_rbc_size(probe, detector.det_rbc_id)
-            if n > n_rbc:
-                chosen, chosen_zoom, rbc_px, n_rbc = probe, zoom, px, n
-        if n_rbc < SCALE_PROBE_MIN_RBC:
-            return base
-
-    net_size = rbc_px * PREDICT_IMGSZ / long_side
-    target = _target_rbc_net_size(net_size, small_band_ok)
-    zoom = 1.0 if target is None else target / net_size
-    if abs(math.log(zoom / chosen_zoom)) < 0.1:   # ja rodou nessa escala
-        return chosen
-    if zoom < 1:
-        return _predict_boxes(detector, [image], _round_imgsz(PREDICT_IMGSZ * zoom), tta)[0]
-    return _tiled_predict(detector, image, zoom, rbc_px, tta)
+    cached = next((v for z, v in cache.items() if abs(math.log(zoom / z)) < 0.1), None)
+    primary = cached if cached is not None else _predict_at_zoom(detector.det, image, zoom, rbc_px, tta)
+    if detector.det2 is None:
+        return primary
+    secondary = _predict_at_zoom(detector.det2, image, zoom, rbc_px, tta)
+    return ([b for b in primary if b[0] == detector.det_rbc_id]
+            + [b for b in secondary if b[0] != detector.det_rbc_id])
 
 
 def _round_imgsz(size: float) -> int:
@@ -455,7 +513,8 @@ def platelet_tile_scan(detector: Detector, image: Image.Image, platelet_class_id
             x1 = min(x0 + TILE_SIZE, width)
             y1 = min(y0 + TILE_SIZE, height)
             tile = image.crop((x0, y0, x1, y1))
-            result = detector.det.predict(
+            model = detector.det2 if detector.det2 is not None else detector.det
+            result = model.predict(
                 source=tile, imgsz=TILE_PREDICT_IMGSZ, conf=TILE_CONF_THRESHOLD, verbose=False
             )[0]
             for box in result.boxes:
