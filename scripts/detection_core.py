@@ -15,12 +15,14 @@ a deteccao de RBC/plaqueta continua igual a do modelo de 3 classes.
 Usado por 04_watch_and_infer.py (monitora pasta) e app.py (GUI) -- nenhum dos
 dois deve duplicar essa logica.
 """
+import hashlib
+import math
 import sys
 from pathlib import Path
 
 import torch
 from PIL import Image, ImageDraw, ImageFont
-from torchvision.ops import box_iou, nms
+from torchvision.ops import batched_nms, box_iou, nms
 from ultralytics import YOLO
 
 
@@ -41,6 +43,9 @@ def resolve_model_path() -> Path:
 
 MODEL_PATH = resolve_model_path()               # detector 3 classes
 CLASSIFIER_PATH = _resolve("wbc_classifier.pt")  # classificador de subtipo
+# banco de exemplos (embeddings) para o kNN do classificador -- gerado por
+# scripts/15_build_wbc_memory.py; opcional
+WBC_MEMORY_PATH = _resolve("wbc_memory.pt")
 
 VALID_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
 CONFIDENCE_THRESHOLD = 0.25
@@ -64,6 +69,43 @@ PLATELET_MIN_CONF = 0.55
 PLATELET_MIN_SIZE_RATIO = 0.10
 PLATELET_MAX_SIZE_RATIO = 0.55
 PLATELET_MERGE_IOU = 0.3
+
+# --- Normalizacao de escala (fotos em distancias diferentes) ---
+# A hemacia tem tamanho fisico quase constante (~7-8 um), entao o tamanho dela
+# em pixels mede o zoom da foto. O detector foi treinado com hemacias em duas
+# faixas de tamanho (px na entrada da rede, lado maior = PREDICT_IMGSZ):
+# fotos de campo largo reais (realslide_, ~25-55 px) e BCCD / TXL-PBC
+# (~175-300 px). Medido com 16_eval_scale_robustness.py e varredura manual:
+#   - imagem tipo BCCD com hemacia <= ~55 px: o detector acha ZERO hemacias;
+#     ampliada para ~100-150 px volta a F1 ~0.7 (o melhor alvo foi ~100-110).
+#   - fotos realslide_ (~38 px): a passada normal e a melhor; ampliar piora.
+# Por isso a faixa pequena so e mantida quando a 1a passada de fato achou
+# hemacias; se achou poucas, testa ampliado/reduzido (ver detect_cells).
+SCALE_NORMALIZATION = True
+RBC_SMALL_BAND = (20.0, 60.0)     # faixa das fotos reais: mantida se achou hemacias
+RBC_SMALL_TARGET = 38.0           # alvo quando a hemacia e menor que a faixa pequena
+RBC_GAP_TARGET = 110.0            # alvo entre as faixas (nenhum dado de treino ali)
+RBC_LARGE_BAND = (175.0, 300.0)
+RBC_LARGE_TARGET = 250.0          # alvo quando a hemacia e maior que a faixa grande
+# com menos hemacias que isso na 1a passada o tamanho medido nao e confiavel:
+# testa tambem 0.5x e SCALE_PROBE_ZOOM x antes de decidir
+SCALE_PROBE_MIN_RBC = 5
+SCALE_PROBE_ZOOM = 3.0
+MAX_SCALE_TILES = 36
+SCALE_TILE_BATCH = 4
+MIN_PREDICT_IMGSZ = 320
+TILE_EDGE_MARGIN_PX = 3
+SCALE_MERGE_IOU = 0.5
+# Test-time augmentation do Ultralytics (flip + 3 escalas por passada):
+# ~2-3x mais lento.
+USE_TTA = False
+
+# --- kNN sobre exemplos (classificador de subtipo) ---
+# Probabilidade final = (1 - KNN_BLEND) * classificador + KNN_BLEND * votos
+# dos KNN_K exemplos mais parecidos do banco models/wbc_memory.pt.
+KNN_BLEND = 0.3
+KNN_K = 10
+KNN_TEMPERATURE = 0.05
 
 # Taxonomia exibida (ordem = class-id usado nas tuplas de deteccao). Os ids
 # 1..5 sao atribuidos pelo classificador; RBC=0 e Platelets=6 vem direto do
@@ -108,10 +150,17 @@ CLASS_COLORS = {
 class Detector:
     """Empacota o detector de 3 classes + o classificador de subtipo."""
 
-    def __init__(self, det_model: YOLO, cls_model: YOLO | None, device: str):
+    def __init__(self, det_model: YOLO, cls_model: YOLO | None, device: str, memory: dict | None = None):
         self.det = det_model
         self.cls = cls_model
         self.device = device
+        # banco do kNN: embeddings normalizados (N, D) + indice de classe do
+        # classificador (N,)
+        self.memory_emb = None
+        self.memory_labels = None
+        if cls_model is not None and memory is not None:
+            self.memory_emb = memory["emb"].float().to(device)
+            self.memory_labels = memory["labels"].long().to(device)
         self.names = dict(DISPLAY_NAMES)   # {id: nome} para os consumidores
         dn = {v: k for k, v in det_model.names.items()}
         self.det_rbc_id = dn.get(RBC_CLASS_NAME)
@@ -130,11 +179,36 @@ class Detector:
         devolve WBC_FALLBACK_ID para todos."""
         if self.cls is None or not crops:
             return [WBC_FALLBACK_ID] * len(crops)
-        results = self.cls.predict(source=crops, imgsz=CLASSIFIER_IMGSZ, verbose=False)
-        out = []
-        for r in results:
-            top = int(r.probs.top1)
-            out.append(self._cls_name_to_id.get(top, WBC_FALLBACK_ID))
+        probs, emb = self.classify_probs(crops)
+        if self.memory_emb is not None and KNN_BLEND > 0:
+            probs = (1 - KNN_BLEND) * probs + KNN_BLEND * self.knn_probs(emb)
+        return [self._cls_name_to_id.get(int(i), WBC_FALLBACK_ID) for i in probs.argmax(1).tolist()]
+
+    def classify_probs(self, crops: list[Image.Image]):
+        """Roda o classificador. Devolve (probs (N, C), embeddings (N, D)
+        normalizados) -- o embedding e a entrada da camada linear final,
+        capturada por hook na mesma passada."""
+        captured = []
+        head_linear = self.cls.model.model[-1].linear
+        hook = head_linear.register_forward_pre_hook(lambda _m, inp: captured.append(inp[0].detach()))
+        try:
+            results = self.cls.predict(source=crops, imgsz=CLASSIFIER_IMGSZ, verbose=False)
+        finally:
+            hook.remove()
+        probs = torch.stack([r.probs.data.float() for r in results]).to(self.device)
+        # na 1a chamada o Ultralytics faz um warmup que tambem passa pelo hook
+        emb = torch.cat(captured)[-len(crops):].float().to(self.device)
+        return probs, torch.nn.functional.normalize(emb, dim=1)
+
+    def knn_probs(self, emb: torch.Tensor) -> torch.Tensor:
+        """Distribuicao de classe pelos KNN_K exemplos mais parecidos do banco
+        (similaridade de cosseno, votos ponderados por softmax)."""
+        sims = emb @ self.memory_emb.T
+        k = min(KNN_K, sims.shape[1])
+        top_sims, top_idx = sims.topk(k, dim=1)
+        weights = torch.softmax(top_sims / KNN_TEMPERATURE, dim=1)
+        out = torch.zeros(emb.shape[0], len(self.cls.names), device=emb.device)
+        out.scatter_add_(1, self.memory_labels[top_idx], weights)
         return out
 
 
@@ -147,10 +221,29 @@ def load_model(device: str | None = None):
     det = YOLO(str(MODEL_PATH))
     det.to(device)
     cls = None
+    memory = None
     if CLASSIFIER_PATH.exists():
         cls = YOLO(str(CLASSIFIER_PATH))
         cls.to(device)
-    return Detector(det, cls, device), device
+        memory = load_wbc_memory()
+    return Detector(det, cls, device, memory), device
+
+
+def load_wbc_memory(path: Path = WBC_MEMORY_PATH) -> dict | None:
+    """Banco do kNN, se existir e tiver sido gerado com o classificador atual
+    (embeddings de outro checkpoint nao sao comparaveis)."""
+    if not path.exists():
+        return None
+    memory = torch.load(path, map_location="cpu")
+    if memory.get("classifier_sha1") != classifier_sha1():
+        print(f"Aviso: {path.name} foi gerado com outro wbc_classifier.pt -- "
+              f"ignorado. Rode scripts/15_build_wbc_memory.py de novo.")
+        return None
+    return memory
+
+
+def classifier_sha1() -> str:
+    return hashlib.sha1(CLASSIFIER_PATH.read_bytes()).hexdigest()
 
 
 def load_font(size: int = 16):
@@ -185,21 +278,138 @@ def _crop_with_pad(image: Image.Image, x1, y1, x2, y2, pad_frac):
                        min(W, x2 + px), min(H, y2 + py)))
 
 
-def primary_detections(detector: Detector, image: Image.Image):
-    """Detecta RBC/WBC/Platelets na imagem inteira e classifica cada WBC no
-    subtipo. Devolve lista de (class_id, x1, y1, x2, y2, conf) na taxonomia
-    de exibicao (RBC=0, subtipos 1..5, Platelets=6, WBC generico=7)."""
-    result = detector.det.predict(
-        source=image, imgsz=PREDICT_IMGSZ, conf=CONFIDENCE_THRESHOLD,
-        max_det=PREDICT_MAX_DET, verbose=False,
-    )[0]
+def _predict_boxes(detector: Detector, images, imgsz: int, tta: bool):
+    """predict do detector em lote. Devolve, por imagem, lista de
+    (det_id, x1, y1, x2, y2, conf) nas coordenadas daquela imagem."""
+    out = []
+    for i in range(0, len(images), SCALE_TILE_BATCH):
+        results = detector.det.predict(
+            source=images[i:i + SCALE_TILE_BATCH], imgsz=imgsz, conf=CONFIDENCE_THRESHOLD,
+            max_det=PREDICT_MAX_DET, augment=tta, verbose=False,
+        )
+        for r in results:
+            b = r.boxes
+            out.append([(int(c), *xyxy, float(s))
+                        for c, xyxy, s in zip(b.cls.tolist(), b.xyxy.tolist(), b.conf.tolist())])
+    return out
 
+
+def _median_rbc_size(boxes, rbc_id):
+    sizes = sorted(((x2 - x1) + (y2 - y1)) / 2 for c, x1, y1, x2, y2, _ in boxes if c == rbc_id)
+    return (sizes[len(sizes) // 2], len(sizes)) if sizes else (None, 0)
+
+
+def _tiled_predict(detector: Detector, image: Image.Image, zoom: float, cell_px: float, tta: bool):
+    """Deteccao com a imagem ampliada `zoom` vezes (relativo a passada normal
+    em PREDICT_IMGSZ), feita em blocos que a rede ve em PREDICT_IMGSZ.
+    Sobreposicao >= 2.5 celulas: caixas encostadas numa borda interna do bloco
+    (celula cortada) sao descartadas porque a celula aparece inteira no
+    vizinho. `cell_px` = tamanho da hemacia na imagem original."""
+    W, H = image.size
+    tile = max(W, H) / zoom
+    while True:
+        tw, th = min(tile, W), min(tile, H)
+        overlap = min(max(0.2 * tile, 2.5 * cell_px), 0.5 * tile)
+        step = tile - overlap
+        nx = 1 if tw >= W else math.ceil((W - tw) / step) + 1
+        ny = 1 if th >= H else math.ceil((H - th) / step) + 1
+        if nx * ny <= MAX_SCALE_TILES:
+            break
+        tile *= 1.15   # menos zoom para caber no limite de blocos
+    tw, th = int(round(tw)), int(round(th))
+    xs = [min(round(i * step), W - tw) for i in range(nx)]
+    ys = [min(round(j * step), H - th) for j in range(ny)]
+    origins = [(x0, y0) for y0 in ys for x0 in xs]
+    tiles = [image.crop((x0, y0, x0 + tw, y0 + th)) for x0, y0 in origins]
+
+    boxes, scores, classes = [], [], []
+    m = TILE_EDGE_MARGIN_PX
+    for (x0, y0), tile_boxes in zip(origins, _predict_boxes(detector, tiles, PREDICT_IMGSZ, tta)):
+        for c, bx1, by1, bx2, by2, conf in tile_boxes:
+            if (bx1 <= m and x0 > 0) or (by1 <= m and y0 > 0) \
+                    or (bx2 >= tw - m and x0 + tw < W) or (by2 >= th - m and y0 + th < H):
+                continue
+            boxes.append([bx1 + x0, by1 + y0, bx2 + x0, by2 + y0])
+            scores.append(conf)
+            classes.append(c)
+    if not boxes:
+        return []
+    boxes_t = torch.tensor(boxes, dtype=torch.float32)
+    scores_t = torch.tensor(scores, dtype=torch.float32)
+    classes_t = torch.tensor(classes)
+    keep = batched_nms(boxes_t, scores_t, classes_t, SCALE_MERGE_IOU)
+    return [(classes[i], *boxes[i], scores[i]) for i in keep.tolist()]
+
+
+def _target_rbc_net_size(net_size: float, small_band_ok: bool) -> float | None:
+    """Tamanho-alvo da hemacia (px na rede) ou None se ja esta numa faixa em
+    que o detector funciona. `small_band_ok` = a passada normal achou
+    hemacias suficientes, ou seja, a imagem se parece com as fotos de campo
+    largo do treino e a faixa pequena serve."""
+    if net_size > RBC_LARGE_BAND[1]:
+        return RBC_LARGE_TARGET
+    if net_size >= RBC_LARGE_BAND[0]:
+        return None
+    if small_band_ok:
+        if net_size < RBC_SMALL_BAND[0]:
+            return RBC_SMALL_TARGET
+        if net_size <= RBC_SMALL_BAND[1]:
+            return None
+    return max(RBC_GAP_TARGET, net_size)
+
+
+def detect_cells(detector: Detector, image: Image.Image, scale_norm: bool | None = None,
+                 tta: bool | None = None):
+    """Deteccao de 3 classes (ids do detector) com normalizacao de escala
+    opcional -- ver RBC_NET_BANDS."""
+    scale_norm = SCALE_NORMALIZATION if scale_norm is None else scale_norm
+    tta = USE_TTA if tta is None else tta
+    long_side = max(image.size)
+    base = _predict_boxes(detector, [image], PREDICT_IMGSZ, tta)[0]
+    if not scale_norm or detector.det_rbc_id is None:
+        return base
+
+    rbc_px, n_rbc = _median_rbc_size(base, detector.det_rbc_id)
+    small_band_ok = n_rbc >= SCALE_PROBE_MIN_RBC
+    chosen, chosen_zoom = base, 1.0
+    if not small_band_ok:
+        # quase nenhuma hemacia: a foto pode estar tao longe/perto que o
+        # detector nem enxerga. Testa reduzida e ampliada e fica com a que
+        # achar mais hemacias (so para medir o tamanho delas).
+        probes = [
+            (0.5, _predict_boxes(detector, [image], _round_imgsz(PREDICT_IMGSZ * 0.5), tta)[0]),
+            (SCALE_PROBE_ZOOM, _tiled_predict(detector, image, SCALE_PROBE_ZOOM, long_side / 60, tta)),
+        ]
+        for zoom, probe in probes:
+            px, n = _median_rbc_size(probe, detector.det_rbc_id)
+            if n > n_rbc:
+                chosen, chosen_zoom, rbc_px, n_rbc = probe, zoom, px, n
+        if n_rbc < SCALE_PROBE_MIN_RBC:
+            return base
+
+    net_size = rbc_px * PREDICT_IMGSZ / long_side
+    target = _target_rbc_net_size(net_size, small_band_ok)
+    zoom = 1.0 if target is None else target / net_size
+    if abs(math.log(zoom / chosen_zoom)) < 0.1:   # ja rodou nessa escala
+        return chosen
+    if zoom < 1:
+        return _predict_boxes(detector, [image], _round_imgsz(PREDICT_IMGSZ * zoom), tta)[0]
+    return _tiled_predict(detector, image, zoom, rbc_px, tta)
+
+
+def _round_imgsz(size: float) -> int:
+    return max(MIN_PREDICT_IMGSZ, int(round(size / 32)) * 32)
+
+
+def primary_detections(detector: Detector, image: Image.Image, scale_norm: bool | None = None,
+                       tta: bool | None = None):
+    """Detecta RBC/WBC/Platelets (com normalizacao de escala -- ver
+    detect_cells) e classifica cada WBC no subtipo. Devolve lista de
+    (class_id, x1, y1, x2, y2, conf) na taxonomia de exibicao (RBC=0,
+    subtipos 1..5, Platelets=6, WBC generico=7)."""
     detections = []
     wbc_slots = []   # (indice na lista detections, crop)
-    for box in result.boxes:
-        det_id = int(box.cls[0])
-        x1, y1, x2, y2 = (float(v) for v in box.xyxy[0])
-        conf = float(box.conf[0])
+    for det_id, x1, y1, x2, y2, conf in detect_cells(detector, image, scale_norm, tta):
         if det_id == detector.det_rbc_id:
             detections.append((0, x1, y1, x2, y2, conf))
         elif det_id == detector.det_platelet_id:

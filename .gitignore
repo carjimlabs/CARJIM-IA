@@ -26,3 +26,6 @@ models/*
 # Raw slide-scan videos/photos (source material for scripts/14, not versioned)
 /Videos/
 /Pictures/
+
+# Teacher-corrected WBC crops for the kNN bank (scripts/15) -- user data
+/Exemplos de leucocitos/

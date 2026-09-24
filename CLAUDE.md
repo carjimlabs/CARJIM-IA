@@ -55,13 +55,20 @@ later migrated to a dead-end 7-class layout — before re-running `03_train.py`,
 ```
 python scripts/12_build_wbc_classifier_data.py  # Raabin zips -> data/wbc_cls/<split>/<Class>/*.jpg (ImageFolder)
 python scripts/13_train_wbc_classifier.py       # trains YOLOv8-cls (imgsz=128), balances rare classes by duplication, writes models/wbc_classifier.pt
+python scripts/15_build_wbc_memory.py           # kNN example bank (models/wbc_memory.pt) + val accuracy per KNN_BLEND; re-run after 13
 ```
+
+**Evaluation**: `python scripts/16_eval_scale_robustness.py [model.pt ...]` builds synthetic
+zoom variants of the BCCD val split (zoom-in crops, k x k full-resolution mosaics for
+zoom-out) and reports P/R/F1 per class for each detection mode (base / TTA / scale
+normalization / both) into `runs/eval_scale/`. Use it to compare modes and models; BCCD
+doesn't label every RBC, so absolute RBC precision is understated.
 
 **Abandoned single-detector experiment** — `scripts/09_migrate_wbc_taxonomy.py`,
 `10_merge_raabin_wbc.py`, `11_paste_wbc_wide_field.py` built a 7-class detector dataset; it
 never generalized to wide field. Kept for reference only; not part of the live pipeline.
 
-**End-user tools** (need `models/carjim_best.pt`; classifier optional — without it WBCs show as
+**End-user tools** (need `models/carjim_best.pt`; classifier and `wbc_memory.pt` optional — without it WBCs show as
 generic "Leucócito"):
 
 ```
@@ -102,6 +109,23 @@ slower reinforcement pass in small tiles specifically for platelets — they're 
 than RBC/WBC and disappear in a single full-image pass on wide-field photos; expected platelet
 size is computed as a ratio of the RBC size detected in the *same* image, so it self-adjusts to
 photo zoom), `draw_detections()`.
+
+**Scale normalization (`detect_cells()`, called by `primary_detections()`)**: the RBC's
+pixel size measures photo zoom. The detector only works in two RBC-size bands at the network
+input: ~20-60 px (real wide-field photos, `realslide_`) and ~175-300 px (BCCD/TXL-PBC).
+Measured: a BCCD-style image with RBC <= ~55 px yields ZERO RBC detections, but the real
+wide-field photos work best untouched at ~38 px — the small band is appearance-dependent. So
+the small band is trusted only if the normal pass found >= `SCALE_PROBE_MIN_RBC` RBCs;
+otherwise it probes 0.5x and 3x (tiled), measures RBC size, and re-runs at the target
+(tiled upscale via `_tiled_predict` or smaller `imgsz`). Don't "simplify" this into a single
+target size without re-running `16`. `USE_TTA` toggles Ultralytics test-time augmentation.
+
+**WBC kNN (`Detector.knn_probs`)**: an image "RAG" for the subtype classifier — the
+classifier's penultimate embedding (captured by a forward hook on the head's `linear`) is
+matched against `models/wbc_memory.pt` and the neighbours' votes are blended in with
+`KNN_BLEND`. New teacher-corrected crops go in `Exemplos de leucocitos/<Classe>/` and are added
+by re-running `15` — no retraining. The bank stores the classifier's sha1 and is ignored if
+stale.
 
 `detection_core._resolve()` (used for both `MODEL_PATH` and `CLASSIFIER_PATH`, and exported as
 `resolve_model_path()`) resolves `models/*` relative to `sys.executable` when frozen

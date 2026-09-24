@@ -32,6 +32,11 @@ IMG_SIZE = 1280
 # baixe para 4.
 BATCH = 4
 PATIENCE = 20
+# Zoom aleatorio da augmentation: fator sorteado em [1-SCALE_AUG, 1+SCALE_AUG].
+# O default do Ultralytics (0.5) cobre so 0.5x-1.5x; fotos de celular no
+# microscopio variam bem mais de distancia que isso, e o modelo falhava quando
+# as celulas ficavam muito menores/maiores que no treino. 0.75 -> 0.25x-1.75x.
+SCALE_AUG = 0.75
 RUN_NAME = "carjim_train"
 # workers=2 (nao o default 8): a maquina so tem 16 GB de RAM. No Windows cada
 # worker do dataloader e um processo que recarrega torch/opencv (~1 GB), e a
@@ -70,6 +75,7 @@ def main():
         workers=WORKERS,
         device=device,
         patience=PATIENCE,
+        scale=SCALE_AUG,
         project=str(RUNS_DIR / "detect"),
         name=RUN_NAME,
         exist_ok=True,
